@@ -1,0 +1,10 @@
+[package]
+name = "cbi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = "0.2.2"
+
+# xattr 0.2.3 (via gpui) still references libc::ENOATTR, removed in libc 0.2.190+.
+libc = "=0.2.189"
