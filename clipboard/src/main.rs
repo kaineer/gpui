@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, point, prelude::*, px, rgb, size, App, Application, Bounds, ClipboardItem, Context,
@@ -14,10 +14,19 @@ const PANEL_HEIGHT: f32 = 48.0;
 const EDGE_MARGIN: f32 = 12.0;
 const WINDOW_WIDTH: f32 = 420.0;
 const LINE_HEIGHT: f32 = 22.0;
-const VERTICAL_CHROME: f32 = 14.0; // padding + border
+/// Vertical padding inside a row (`py`); keep in sync with `.py(px(PAD_Y))`.
+const PAD_Y: f32 = 4.0;
+const BORDER_WIDTH: f32 = 1.0;
+/// Top/bottom padding + borders around the text block.
+const VERTICAL_CHROME: f32 = PAD_Y * 2.0 + BORDER_WIDTH * 2.0;
 const ROW_GAP: f32 = 4.0;
 const MAX_LINES: usize = 10;
 const MAX_HISTORY: usize = 5;
+
+const OPACITY_ACTIVE: f32 = 1.0;
+const OPACITY_INACTIVE: f32 = 0.6;
+const HIDE_DELAY: Duration = Duration::from_millis(300);
+const HIDE_FADE: Duration = Duration::from_millis(500);
 
 const BORDER_CURRENT: u32 = 0x88c0d0;
 const BORDER_HISTORY: u32 = 0x5e81ac;
@@ -30,6 +39,11 @@ struct ClipboardLine {
     history: VecDeque<String>,
     expanded: bool,
     hovered: bool,
+    /// History stays visible during leave delay/fade.
+    show_history: bool,
+    opacity: f32,
+    /// Set when the cursor leaves while history is visible.
+    unhover_since: Option<Instant>,
 }
 
 impl ClipboardLine {
@@ -64,6 +78,9 @@ impl ClipboardLine {
             history: VecDeque::new(),
             expanded: false,
             hovered: false,
+            show_history: false,
+            opacity: OPACITY_INACTIVE,
+            unhover_since: None,
         }
     }
 
@@ -116,7 +133,7 @@ impl ClipboardLine {
     }
 
     fn window_size(&self) -> Size<Pixels> {
-        let history_count = if self.hovered {
+        let history_count = if self.show_history {
             self.history.len() as f32
         } else {
             0.0
@@ -135,6 +152,53 @@ impl ClipboardLine {
     fn apply_window_bounds(&self, window: &mut Window, cx: &App) {
         let bounds = anchored_bounds(self.window_size(), cx);
         place_app_window(bounds, window.scale_factor());
+    }
+
+    fn sync_hover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hovered = window.is_window_hovered();
+
+        if hovered {
+            let need_resize = !self.show_history;
+            self.hovered = true;
+            self.unhover_since = None;
+            self.show_history = true;
+            self.opacity = OPACITY_ACTIVE;
+            if need_resize {
+                self.apply_window_bounds(window, cx);
+            }
+            return;
+        }
+
+        self.hovered = false;
+
+        if !self.show_history {
+            self.opacity = OPACITY_INACTIVE;
+            self.unhover_since = None;
+            return;
+        }
+
+        let since = *self.unhover_since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed();
+
+        if elapsed < HIDE_DELAY {
+            self.opacity = OPACITY_ACTIVE;
+            window.request_animation_frame();
+            return;
+        }
+
+        if elapsed < HIDE_DELAY + HIDE_FADE {
+            let t =
+                ((elapsed - HIDE_DELAY).as_secs_f32() / HIDE_FADE.as_secs_f32()).clamp(0.0, 1.0);
+            self.opacity = OPACITY_ACTIVE + (OPACITY_INACTIVE - OPACITY_ACTIVE) * t;
+            window.request_animation_frame();
+            return;
+        }
+
+        self.show_history = false;
+        self.expanded = false;
+        self.opacity = OPACITY_INACTIVE;
+        self.unhover_since = None;
+        self.apply_window_bounds(window, cx);
     }
 
     fn toggle_expanded(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -179,13 +243,9 @@ impl ClipboardLine {
 
 impl Render for ClipboardLine {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let hovered = window.is_window_hovered();
-        if self.hovered != hovered {
-            self.hovered = hovered;
-            self.apply_window_bounds(window, cx);
-        }
+        self.sync_hover(window, cx);
 
-        let history_rows = if self.hovered {
+        let history_rows = if self.show_history {
             self.history
                 .iter()
                 .enumerate()
@@ -196,9 +256,9 @@ impl Render for ClipboardLine {
                         .id(("history", index))
                         .flex()
                         .flex_row()
-                        .items_center()
+                        .items_start()
                         .px_3()
-                        .py_1()
+                        .py(px(PAD_Y))
                         .h(px(Self::collapsed_row_height()))
                         .w_full()
                         .rounded_md()
@@ -241,7 +301,7 @@ impl Render for ClipboardLine {
             .flex_col()
             .gap(px(ROW_GAP))
             .size_full()
-            .opacity(if self.hovered { 1.0 } else { 0.6 })
+            .opacity(self.opacity)
             .children(history_rows)
             .child(self.render_current(cx))
     }
@@ -292,21 +352,18 @@ impl ClipboardLine {
                 .child(lines[0].clone())
         };
 
+        let row_height =
+            VERTICAL_CHROME + self.current_visible_line_count() as f32 * LINE_HEIGHT;
+
         div()
             .id("clipboard")
             .flex()
             .flex_row()
-            .when(self.expanded, |el| el.items_start())
-            .when(!self.expanded, |el| el.items_center())
+            .items_start()
             .px_3()
-            .py_1()
+            .py(px(PAD_Y))
             .w_full()
-            .when(!self.expanded, |el| el.h(px(Self::collapsed_row_height())))
-            .when(self.expanded, |el| {
-                el.h(px(
-                    VERTICAL_CHROME + self.current_visible_line_count() as f32 * LINE_HEIGHT
-                ))
-            })
+            .h(px(row_height))
             .rounded_md()
             .border_1()
             .border_color(rgb(BORDER_CURRENT))
